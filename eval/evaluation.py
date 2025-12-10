@@ -3,11 +3,12 @@
 Evaluation helpers for ICM experiments.
 ICM 实验用的评估辅助脚本。
 
-- Support four settings:
-  * "zero_shot"       : base model, no context.
-  * "zero_shot_chat"  : chat/Instruct model, no context.
-  * "supervised"      : gold-supervision few-shot context.
-  * "unsupervised"    : ICM-selected few-shot context.
+- Support five settings:
+  * "zero_shot"         : base model, no context.
+  * "zero_shot_chat"    : chat/Instruct model, no context.
+  * "supervised"        : gold-supervision many-shot context (auto-packed).
+  * "unsupervised"      : ICM-selected few-shot context.
+  * "random_few_shot"   : randomly selected fixed-K few-shot, using gold labels.
 
 - All settings use the SAME way to measure accuracy:
   parse model text output -> binary label (0/1) -> compare with gold.
@@ -18,7 +19,7 @@ import os
 import re
 import json
 import asyncio
-import random  # NEW: 用于可复现的随机打乱
+import random  # Used for reproducible shuffling and random few-shot / 用于可复现的随机打乱与随机 few-shot
 from datetime import datetime
 
 from tqdm import tqdm
@@ -120,7 +121,7 @@ def _format_example_line(ex: dict, include_answer: bool = True) -> str:
 def _build_fewshot_context(examples: list[dict]) -> str:
     """
     Build few-shot context from a list of examples with labels.
-    从带标签的若干示例构造 few-shot 上下文（用于 supervised / unsupervised）。
+    从带标签的若干示例构造 few-shot 上下文（用于 supervised / unsupervised / random_few_shot）。
 
     examples: list[dict] with fields "question", "choice", "label".
     """
@@ -173,12 +174,12 @@ def _build_eval_prompt(
         I think this claim is
 
     - "zero_shot", "zero_shot_chat": no few-shot context.
-    - "supervised", "unsupervised": prepend few-shot examples.
+    - "supervised", "unsupervised", "random_few_shot": prepend few-shot examples.
     """
-    # Few-shot context for supervised / unsupervised.
-    # 在 supervised / unsupervised 下加入 few-shot 上下文。
+    # Few-shot context for supervised / unsupervised / random few-shot.
+    # 在 supervised / unsupervised / random_few_shot 下加入 few-shot 上下文。
     context = ""
-    if setting in ("supervised", "unsupervised") and fewshot_examples:
+    if setting in ("supervised", "unsupervised", "random_few_shot") and fewshot_examples:
         context = _build_fewshot_context(fewshot_examples)
 
     # 当前要判定的样本：只给 Question + Claim + "I think this claim is"。
@@ -407,7 +408,7 @@ def _predict_all_sequential(
 
 # ============================================================
 # Evaluation main function
-# 统一的评估入口：zero-shot / supervised / unsupervised
+# 统一的评估入口：zero-shot / supervised / unsupervised / random few-shot
 # ============================================================
 
 def evaluate(
@@ -422,13 +423,15 @@ def evaluate(
     icm_max_iter: int = 500,
     icm_consistency_mode: str = "at_most_one_true",
     icm_enforce_unique_cid: bool = False,
-    max_context_tokens: int = 131072,  # NEW: 模型可接受的最大上下文长度（Llama 3.1 405B 默认 128k+）
-    fewshot_seed: int = 42,            # NEW: 控制 supervised many-shot 的随机打乱
+    max_context_tokens: int = 131072,  # 模型可接受的最大上下文长度（Llama 3.1 405B 默认 128k+）
+    fewshot_seed: int = 42,            # 控制 supervised / random few-shot 的随机打乱
+    random_fewshot_k: int = 8,         # random_few_shot 使用的示例数量 K
     timeout: float = 60.0,
     max_tokens: int = 16,
     debug: bool = False,
     save_result: bool = True,
     result_root: str | None = None,
+    icm_result_root: str | None = None,
     dataset_name: str = "truthfulqa",
 ):
     """
@@ -441,7 +444,8 @@ def evaluate(
             测试集（list[dict] 或 JSON 文件路径）。
 
         setting:
-            "zero_shot" | "zero_shot_chat" | "supervised" | "unsupervised"
+            "zero_shot" | "zero_shot_chat" | "supervised"
+            | "unsupervised" | "random_few_shot"
 
         model:
             Model name to evaluate.
@@ -452,8 +456,8 @@ def evaluate(
             Hyperbolic API 密钥；若为 None，则从环境变量读取。
 
         train_data_for_icm:
-            Training data used for supervised/unsupervised few-shot.
-            可用于 supervised / unsupervised few-shot 的训练集（list 或 路径）。
+            Training data used for supervised/unsupervised/random_few_shot few-shot.
+            可用于 supervised / unsupervised / random_few_shot few-shot 的训练集（list 或 路径）。
 
         icm_*:
             Params passed to icm_main when setting="unsupervised".
@@ -461,11 +465,15 @@ def evaluate(
 
         max_context_tokens:
             Maximum total input token budget (approx) for the model context.
-            模型可接受的最大上下文 token 数（近似，用于 few-shot 打包预算）。
+            模型可接受的最大上下文 token 数（近似，用于 supervised many-shot 上下文预算）。
 
         fewshot_seed:
-            Random seed for shuffling training data in supervised many-shot.
-            用于 supervised many-shot 下随机打乱训练集的随机种子。
+            Random seed for shuffling training data in supervised/random few-shot.
+            用于 supervised / random_few_shot 下随机打乱训练集的随机种子。
+
+        random_fewshot_k:
+            Number of examples in random_few_shot few-shot context.
+            random_few_shot 模式下 few-shot 示例数量 K。
 
         timeout, max_tokens:
             Forwarded to Hyperbolic helper.
@@ -476,19 +484,33 @@ def evaluate(
             是否输出调试信息。
 
         save_result:
-            Whether to save per-example + summary JSON files.
-            是否保存逐条结果和 summary JSON。
+            Whether to save per-example + summary + arguments JSON files.
+            是否保存逐条结果、summary 以及参数 JSON。
 
         result_root:
-            Root folder for saving results. If None, create one as
-            {project_root}/results/{timestamp}.
-            结果保存的根目录。若为 None，则自动创建
-            {项目根目录}/results/{timestamp}。
+            Folder for saving evaluation results. If provided, files are saved under
+            {result_root}/. If None, a new attempt folder
+            {project_root}/results/attempt_{timestamp}/evaluation/ is created.
+            评估结果保存目录。若提供，则直接在该目录下保存；
+            若为 None，则会新建
+            {项目根目录}/results/attempt_{timestamp}/evaluation/。
+
+        icm_result_root:
+            Folder for saving ICM results when setting="unsupervised".
+            If None and result_root is provided, defaults to a sibling
+            {dirname(result_root)}/icm. If both are None and save_result=True,
+            defaults to attempt_{timestamp}/icm.
+            当 setting="unsupervised" 且 save_result=True 时 ICM 结果保存目录。
+            若为 None 且提供了 result_root，则默认使用
+            {dirname(result_root)}/icm；若两者均为 None 且 save_result=True，
+            则使用 attempt_{timestamp}/icm。
 
         dataset_name:
             Name tag for result file names, e.g. "truthfulqa".
             用于结果文件命名的标签，例如 "truthfulqa"。
     """
+    start_time = datetime.now().isoformat()  # Record evaluation start time / 记录评估开始时间
+
     # Resolve API key.
     # 处理 API Key。
     if api_key is None:
@@ -506,23 +528,46 @@ def evaluate(
     )
 
     # --------------------------------------------------------
-    # Prepare few-shot examples for supervised / unsupervised.
-    # 为 supervised / unsupervised 情况准备 few-shot 示例。
+    # Resolve default result_root / icm_result_root when needed.
+    # 在需要时解析默认的 result_root / icm_result_root。
+    # --------------------------------------------------------
+    project_root = _resolve_project_root()
+    attempt_root = None
+
+    if result_root is not None:
+        # When caller specifies result_root, treat its parent as attempt root.
+        # 若调用方显式提供 result_root，则其上一级目录视为 attempt 根目录。
+        attempt_root = os.path.dirname(result_root)
+        if icm_result_root is None:
+            icm_result_root = os.path.join(attempt_root, "icm")
+    elif save_result:
+        # No result_root given: create a fresh attempt folder.
+        # 若未提供 result_root 且需要保存结果，则创建新的 attempt 目录。
+        timestamp_for_attempt = datetime.now().strftime("%Y%m%d_%H%M%S")
+        attempt_root = os.path.join(project_root, "results", f"attempt_{timestamp_for_attempt}")
+        result_root = os.path.join(attempt_root, "evaluation")
+        if icm_result_root is None:
+            icm_result_root = os.path.join(attempt_root, "icm")
+
+    # --------------------------------------------------------
+    # Prepare few-shot examples for supervised / unsupervised / random_few_shot.
+    # 为 supervised / unsupervised / random_few_shot 情况准备 few-shot 示例。
     # --------------------------------------------------------
     fewshot_examples: list[dict] | None = None
 
-    if setting in ("supervised", "unsupervised"):
+    if setting in ("supervised", "unsupervised", "random_few_shot"):
         if train_data_for_icm is None:
             raise ValueError(
-                "train_data_for_icm is required for supervised/unsupervised evaluation. / "
-                "在 supervised/unsupervised 评估中必须提供 train_data_for_icm。"
+                "train_data_for_icm is required for supervised/unsupervised/random_few_shot "
+                "evaluation. / 在 supervised/unsupervised/random_few_shot 评估中必须提供 "
+                "train_data_for_icm。"
             )
 
         train_list = load_dataset_maybe(train_data_for_icm)
         if not train_list:
             raise ValueError(
-                "Empty training data for supervised/unsupervised. / "
-                "用于 supervised/unsupervised 的训练集为空。"
+                "Empty training data for supervised/unsupervised/random_few_shot. / "
+                "用于 supervised/unsupervised/random_few_shot 的训练集为空。"
             )
 
         # --- supervised: gold supervision with random+greedy many-shot packing ---
@@ -577,13 +622,26 @@ def evaluate(
                 f"(max_context_tokens={max_context_tokens})"
             )
 
+        # --- random_few_shot: simple random K gold-labeled examples ---
+        # --- random_few_shot：简单随机选取 K 条 gold 标签 few-shot 示例 ---
+        elif setting == "random_few_shot":
+            rng = random.Random(fewshot_seed)
+            shuffled_train = list(train_list)
+            rng.shuffle(shuffled_train)
+            k = min(max(0, random_fewshot_k), len(shuffled_train))
+            fewshot_examples = shuffled_train[:k]
+            print(
+                f"[EVAL] Random few-shot: seed={fewshot_seed}, "
+                f"K={len(fewshot_examples)} (requested={random_fewshot_k})"
+            )
+
         # --- unsupervised: run ICM on training data to select subset D ---
         # --- unsupervised：在训练集上运行 ICM，选出子集 D 作为 few-shot 示例 ---
         elif setting == "unsupervised":
             print("[EVAL] Running ICM on training data for unsupervised few-shot...")
             icm_subset = icm_main(
                 data=train_list,
-                model=model,  # you can also force base model here if desired
+                model=model,  # you can also force base model here if desired / 如需也可以在此强制使用 base 模型
                 api_key=api_key,
                 mp_method=icm_mp_method,
                 alpha=icm_alpha,
@@ -595,14 +653,15 @@ def evaluate(
                 scheduler="log",
                 use_consistency_term=True,
                 timeout=timeout,
-                top_logprobs=20,  # ICM objective still uses logprobs internally
+                top_logprobs=20,  # ICM objective still uses logprobs internally / ICM 目标仍依赖 logprobs
                 max_concurrent=4,
-                save_result=True,  # always save ICM result during evaluation
+                save_result=save_result,  # 仅当评估需要保存结果时才保存 ICM 结果
                 result_prefix=f"icm_eval_{dataset_name}",
                 seed=42,
                 debug=debug,
                 consistency_mode=icm_consistency_mode,
                 enforce_unique_cid=icm_enforce_unique_cid,
+                result_root=icm_result_root,
             )
 
             # icm_subset contains ICM's 0/1 labels in "label", used as few-shot Answer.
@@ -622,7 +681,7 @@ def evaluate(
         api_key=api_key,
         fewshot_examples=fewshot_examples,
         timeout=timeout,
-        top_logprobs=0,       # evaluation does NOT use logprobs
+        top_logprobs=0,       # evaluation does NOT use logprobs / 评估阶段不依赖 logprobs
         max_tokens=max_tokens,
         debug=debug,
         database=True,
@@ -726,20 +785,14 @@ def evaluate(
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 
     # --------------------------------------------------------
-    # Save results: per-example JSON + summary JSON.
-    # 保存结果：逐条 JSON + summary JSON。
+    # Save results: arguments + per-example JSON + summary JSON.
+    # 保存结果：参数 JSON + 逐条 JSON + summary JSON。
     # --------------------------------------------------------
     result_path = None
     summary_path = None
+    arguments_path = None
 
-    if save_result:
-        project_root = _resolve_project_root()
-
-        # Root results dir: {project_root}/results/{timestamp}/
-        # 根目录：{项目根目录}/results/{timestamp}/
-        if result_root is None:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            result_root = os.path.join(project_root, "results", timestamp)
+    if save_result and result_root is not None:
         os.makedirs(result_root, exist_ok=True)
 
         # File names: e.g. zero_shot_truthfulqa.json, zero_shot_truthfulqa_summary.json
@@ -747,6 +800,7 @@ def evaluate(
         base_name = f"{setting}_{dataset_name}"
         result_path = os.path.join(result_root, f"{base_name}.json")
         summary_path = os.path.join(result_root, f"{base_name}_summary.json")
+        arguments_path = os.path.join(result_root, f"{base_name}_arguments.json")
 
         with open(result_path, "w", encoding="utf-8") as f:
             json.dump(per_example_records, f, ensure_ascii=False, indent=2)
@@ -754,23 +808,60 @@ def evaluate(
         with open(summary_path, "w", encoding="utf-8") as f:
             json.dump(summary, f, ensure_ascii=False, indent=2)
 
+        # Build argument snapshot (redact secrets).
+        # 构造参数快照（不保存敏感信息）。
+        fewshot_k = len(fewshot_examples) if fewshot_examples else 0
+        eval_args = {
+            "setting": setting,
+            "model": model,
+            "data": data if isinstance(data, str) else "<in-memory>",
+            "train_data_for_icm": (
+                train_data_for_icm if isinstance(train_data_for_icm, str) else "<in-memory>"
+            ),
+            "icm_mp_method": icm_mp_method,
+            "icm_alpha": icm_alpha,
+            "icm_target_subset_size": icm_target_subset_size,
+            "icm_max_iter": icm_max_iter,
+            "icm_consistency_mode": icm_consistency_mode,
+            "icm_enforce_unique_cid": icm_enforce_unique_cid,
+            "max_context_tokens": max_context_tokens,
+            "fewshot_seed": fewshot_seed,
+            "random_fewshot_k": random_fewshot_k,
+            "timeout": timeout,
+            "max_tokens": max_tokens,
+            "debug": debug,
+            "save_result": save_result,
+            "result_root": result_root,
+            "icm_result_root": icm_result_root,
+            "dataset_name": dataset_name,
+            "fewshot_size": fewshot_k,
+            "start_time": start_time,
+            "saved_time": datetime.now().isoformat(),
+            "api_key_source": "env" if api_key is None else "provided_or_env",
+        }
+
+        with open(arguments_path, "w", encoding="utf-8") as f:
+            json.dump(eval_args, f, ensure_ascii=False, indent=2)
+
         print(f"[EVAL] Per-example results saved to: {result_path}")
         print(f"[EVAL] Summary saved to: {summary_path}")
+        print(f"[EVAL] Arguments saved to: {arguments_path}")
 
     return {
         "summary": summary,
         "per_example": per_example_records,
         "result_path": result_path,
         "summary_path": summary_path,
+        "arguments_path": arguments_path,
     }
 
 
 # ============================================================
-# Demo: run four settings on TruthfulQA test set
-# 在 TruthfulQA 测试集上演示四种设置的评估
+# Demo: run multiple settings on TruthfulQA test set
+# 在 TruthfulQA 测试集上演示多种设置的评估
 # ============================================================
 
-def run_evaluation_demo():
+def run_evaluation_demo(settings: list[str] | None = None):
     """
     Run evaluation demo on TruthfulQA-style data.
     使用 TruthfulQA 样式数据运行评估 Demo。
@@ -781,6 +872,12 @@ def run_evaluation_demo():
     假设：
         - 项目根目录存在 truthfulqa_train.json
         - 项目根目录存在 truthfulqa_test.json
+
+    settings:
+        List of settings to run. If None, runs all:
+        ["zero_shot", "zero_shot_chat", "supervised", "unsupervised", "random_few_shot"].
+        要运行的 setting 列表。若为 None，则默认运行：
+        ["zero_shot", "zero_shot_chat", "supervised", "unsupervised", "random_few_shot"]。
     """
     project_root = _resolve_project_root()
     train_path = os.path.join(project_root, "truthfulqa_train.json")
@@ -791,85 +888,134 @@ def run_evaluation_demo():
 
     api_key = get_env_api_key()
 
-    # Use a shared timestamp folder for all settings.
-    # 为所有 setting 使用同一个 timestamp 结果目录。
+    # Use a shared attempt folder for all settings.
+    # 为所有 setting 使用同一个 attempt 结果目录。
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    result_root = os.path.join(project_root, "results", timestamp)
-    os.makedirs(result_root, exist_ok=True)
+    attempt_root = os.path.join(project_root, "results", f"attempt_{timestamp}")
+    eval_root = os.path.join(attempt_root, "evaluation")
+    icm_root = os.path.join(attempt_root, "icm")
+    os.makedirs(eval_root, exist_ok=True)
+    os.makedirs(icm_root, exist_ok=True)
 
     print("========== Running Evaluation Demo on TruthfulQA ==========\n")
+    print(f"[DEMO] Attempt folder: {attempt_root}")
 
-    # ------------------ zero-shot (base) ------------------
-    print("\n[DEMO] Running Zero-Shot (base model)...")
-    evaluate(
-        data=test_path,
-        setting="zero_shot",
-        model=base_model,
-        api_key=api_key,
-        train_data_for_icm=None,   # not used
-        timeout=60.0,
-        max_tokens=20,
-        debug=False,
-        save_result=True,
-        result_root=result_root,
-        dataset_name="truthfulqa",
-    )
+    if settings is None:
+        settings = [
+            "zero_shot",
+            "zero_shot_chat",
+            "supervised",
+            "unsupervised",
+            "random_few_shot",
+        ]
 
-    # ------------------ zero-shot-chat (Instruct) ------------------
-    print("\n[DEMO] Running Zero-Shot-Chat (chat model)...")
-    evaluate(
-        data=test_path,
-        setting="zero_shot_chat",
-        model=chat_model,
-        api_key=api_key,
-        train_data_for_icm=None,
-        timeout=60.0,
-        max_tokens=20,
-        debug=False,
-        save_result=True,
-        result_root=result_root,
-        dataset_name="truthfulqa",
-    )
+    # Normalize to unique, ordered list.
+    # 规范化为不重复的有序列表。
+    seen = set()
+    normalized_settings: list[str] = []
+    for s in settings:
+        if s not in seen:
+            seen.add(s)
+            normalized_settings.append(s)
 
-    # ------------------ supervised (many-shot with gold labels) ------------------
-    print("\n[DEMO] Running Supervised Many-Shot (base model)...")
-    evaluate(
-        data=test_path,
-        setting="supervised",
-        model=base_model,
-        api_key=api_key,
-        train_data_for_icm=train_path,
-        icm_target_subset_size=8,  # 对 supervised 已不再用于控制 K，仅对 unsupervised 生效
-        timeout=60.0,
-        max_tokens=20,
-        debug=False,
-        save_result=True,
-        result_root=result_root,
-        dataset_name="truthfulqa",
-    )
+    for setting in normalized_settings:
+        if setting == "zero_shot":
+            print("\n[DEMO] Running Zero-Shot (base model)...")
+            evaluate(
+                data=test_path,
+                setting="zero_shot",
+                model=base_model,
+                api_key=api_key,
+                train_data_for_icm=None,   # not used / 未使用
+                timeout=60.0,
+                max_tokens=20,
+                debug=False,
+                save_result=True,
+                result_root=eval_root,
+                icm_result_root=icm_root,
+                dataset_name="truthfulqa",
+            )
 
-    # ------------------ unsupervised (ICM few-shot) ------------------
-    print("\n[DEMO] Running Unsupervised (ICM, base model)...")
-    evaluate(
-        data=test_path,
-        setting="unsupervised",
-        model=base_model,
-        api_key=api_key,
-        train_data_for_icm=train_path,
-        icm_mp_method="official",
-        icm_alpha=1.0,
-        icm_target_subset_size=8,
-        icm_max_iter=256 * 25,
-        icm_consistency_mode="at_most_one_true",
-        icm_enforce_unique_cid=True,
-        timeout=60.0,
-        max_tokens=20,
-        debug=False,
-        save_result=True,
-        result_root=result_root,
-        dataset_name="truthfulqa",
-    )
+        elif setting == "zero_shot_chat":
+            print("\n[DEMO] Running Zero-Shot-Chat (chat model)...")
+            evaluate(
+                data=test_path,
+                setting="zero_shot_chat",
+                model=chat_model,
+                api_key=api_key,
+                train_data_for_icm=None,
+                timeout=60.0,
+                max_tokens=20,
+                debug=False,
+                save_result=True,
+                result_root=eval_root,
+                icm_result_root=icm_root,
+                dataset_name="truthfulqa",
+            )
+
+        elif setting == "supervised":
+            print("\n[DEMO] Running Supervised Many-Shot (base model)...")
+            evaluate(
+                data=test_path,
+                setting="supervised",
+                model=base_model,
+                api_key=api_key,
+                train_data_for_icm=train_path,
+                icm_target_subset_size=8,  # 对 supervised 已不再用于控制 K，仅对 unsupervised 生效
+                timeout=60.0,
+                max_tokens=20,
+                debug=False,
+                save_result=True,
+                result_root=eval_root,
+                icm_result_root=icm_root,
+                dataset_name="truthfulqa",
+            )
+
+        elif setting == "unsupervised":
+            print("\n[DEMO] Running Unsupervised (ICM, base model)...")
+            evaluate(
+                data=test_path,
+                setting="unsupervised",
+                model=base_model,
+                api_key=api_key,
+                train_data_for_icm=train_path,
+                icm_mp_method="official",
+                icm_alpha=1.0,
+                icm_target_subset_size=8,
+                icm_max_iter=256 * 25,
+                icm_consistency_mode="at_most_one_true",
+                icm_enforce_unique_cid=True,
+                timeout=60.0,
+                max_tokens=20,
+                debug=False,
+                save_result=True,
+                result_root=eval_root,
+                icm_result_root=icm_root,
+                dataset_name="truthfulqa",
+            )
+
+        elif setting == "random_few_shot":
+            print("\n[DEMO] Running Random Few-Shot (base model)...")
+            evaluate(
+                data=test_path,
+                setting="random_few_shot",
+                model=base_model,
+                api_key=api_key,
+                train_data_for_icm=train_path,
+                random_fewshot_k=8,
+                timeout=60.0,
+                max_tokens=20,
+                debug=False,
+                save_result=True,
+                result_root=eval_root,
+                icm_result_root=icm_root,
+                dataset_name="truthfulqa",
+            )
+        else:
+            print(f"[DEMO] Unknown setting '{setting}', skipped. / 未知 setting '{setting}'，已跳过。")
 
 
 if __name__ == "__main__":
+    # 默认运行完整 Demo。
+    # By default, run the full demo.
     run_evaluation_demo()

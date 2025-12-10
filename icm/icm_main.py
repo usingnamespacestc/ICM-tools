@@ -80,6 +80,16 @@ DEMO_DATA = [
 DEMO_MODEL = "meta-llama/Meta-Llama-3.1-405B"
 
 
+def _resolve_project_root() -> str:
+    """
+    Resolve project root as parent of current file's directory.
+    将项目根目录视为当前文件所在目录的上一级目录。
+    """
+    current_dir = os.path.dirname(os.path.abspath(__file__))  # icm/
+    project_root = os.path.dirname(current_dir)
+    return project_root
+
+
 # ============================================================
 # U(D) computation
 # U(D) 计算：支持不同 MP 方法与不同 I(D) 规则
@@ -528,6 +538,7 @@ def icm_main(
     debug: bool = False,
     consistency_mode: str = "at_most_one_true",
     enforce_unique_cid: bool = False,
+    result_root: str | None = None,
 ):
     """
     ICM main loop (simulated annealing over subset + labels).
@@ -702,13 +713,16 @@ def icm_main(
             若为 False，则不再强制唯一性，由 I(D) 对逻辑不一致的 group
             进行惩罚（软约束，更接近原论文的设定）。
 
-    Returns / 返回:
-        list[dict]:
-            Final subset D with ICM labels in "label" and optional
-            "gold_label" preserved.
-            最终子集 D，其中 "label" 为 ICM 搜索得到的标签，
-            若存在 "gold_label" 则保留原始数据集标签以供对比。
+        result_root:
+            If provided, save target_subset.json, ud.json and icm_arguments.json
+            directly under this directory. If None, fall back to the legacy
+            layout {project_root}/results/RP_{...}/.
+            若提供，则直接在该目录下保存 target_subset.json、ud.json
+            与 icm_arguments.json；若为 None，则回退到旧的
+            {项目根目录}/results/RP_{...}/ 布局。
     """
+    run_start_time = datetime.now().isoformat()  # 记录 ICM 运行开始时间
+
     # Set random seed.
     # 设置随机种子。
     if seed is not None:
@@ -1098,28 +1112,26 @@ def icm_main(
     # 如需保存结果到 JSON。
     if save_result:
         # ------------------------------------------------------------
-        # Resolve results directory based on project root.
-        # 基于项目根目录解析 results 目录路径（不依赖工作目录）
+        # Resolve folder_path based on result_root or legacy layout.
+        # 基于 result_root 或旧布局解析结果目录路径。
         # ------------------------------------------------------------
-        current_dir = os.path.dirname(os.path.abspath(__file__))  # icm/
-        project_root = os.path.dirname(current_dir)  # 项目根目录
-        results_dir = os.path.join(project_root, "results")  # project_root/results/
+        if result_root is not None:
+            folder_path = result_root
+            os.makedirs(folder_path, exist_ok=True)
+        else:
+            # Legacy layout under project_root/results/RP_...
+            # 旧布局：保存在 project_root/results/RP_... 目录下。
+            project_root = _resolve_project_root()
+            results_dir = os.path.join(project_root, "results")
+            os.makedirs(results_dir, exist_ok=True)
 
-        # ------------------------------------------------------------
-        # Ensure results directory exists.
-        # 若 results 目录不存在则自动创建
-        # ------------------------------------------------------------
-        os.makedirs(results_dir, exist_ok=True)
-
-        # ------------------------------------------------------------
-        # Build folder name.
-        # 构建结果子目录名称：
-        #   {result_prefix}_{timestamp}_{mp_method}_{consistency_mode}
-        # ------------------------------------------------------------
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        folder_name = f"RP_{result_prefix}_TS_{timestamp}_MM_{mp_method}_CM_{consistency_mode}_UC_{enforce_unique_cid}"
-        folder_path = os.path.join(results_dir, folder_name)
-        os.makedirs(folder_path, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            folder_name = (
+                f"RP_{result_prefix}_TS_{timestamp}_MM_{mp_method}_"
+                f"CM_{consistency_mode}_UC_{enforce_unique_cid}"
+            )
+            folder_path = os.path.join(results_dir, folder_name)
+            os.makedirs(folder_path, exist_ok=True)
 
         # ------------------------------------------------------------
         # Save final subset as target_subset.json
@@ -1138,6 +1150,41 @@ def icm_main(
         with open(ud_path, "w", encoding="utf-8") as f:
             json.dump(u_trace, f, ensure_ascii=False, indent=2)
         print(f"[ICM] U(D) trace saved to: {ud_path}")
+
+        # ------------------------------------------------------------
+        # Save ICM arguments snapshot as icm_arguments.json
+        # 保存 ICM 启动参数快照为 icm_arguments.json
+        # ------------------------------------------------------------
+        args_path = os.path.join(folder_path, "icm_arguments.json")
+        icm_args = {
+            "data": data if isinstance(data, str) else "<in-memory>",
+            "model": model,
+            "mp_method": mp_method,
+            "alpha": alpha,
+            "target_subset_size": target_subset_size,
+            "max_iter": max_iter,
+            "initial_t": initial_t,
+            "final_t": final_t,
+            "decay": decay,
+            "scheduler": scheduler,
+            "use_consistency_term": use_consistency_term,
+            "timeout": timeout,
+            "top_logprobs": top_logprobs,
+            "max_concurrent": max_concurrent,
+            "save_result": save_result,
+            "result_prefix": result_prefix,
+            "result_root": result_root,
+            "seed": seed,
+            "debug": debug,
+            "consistency_mode": consistency_mode,
+            "enforce_unique_cid": enforce_unique_cid,
+            "run_start_time": run_start_time,
+            "saved_time": datetime.now().isoformat(),
+            "api_key_source": "env" if api_key is None else "provided_or_env",
+        }
+        with open(args_path, "w", encoding="utf-8") as f:
+            json.dump(icm_args, f, ensure_ascii=False, indent=2)
+        print(f"[ICM] Arguments saved to: {args_path}")
 
     return final_subset
 
@@ -1205,11 +1252,23 @@ def run_icm_demo():
     - use compute_u as the objective (label-signed MP + optional I(D)).
       使用 compute_u 作为目标函数（按标签带符号的 MP + 可选 I(D)）。
     """
-    sample_data = "truthfulqa_train.json"
+    project_root = _resolve_project_root()
+    sample_data = os.path.join(project_root, "truthfulqa_train.json")
     model = DEMO_MODEL
     api_key = get_env_api_key()
 
-    print("Running ICM demo on TruthfulQA-like data... / 在 TruthfulQA 数据上运行 ICM Demo...")
+    # Create an attempt folder with an 'icm' subfolder.
+    # 创建一个带 icm 子目录的 attempt 目录。
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    attempt_root = os.path.join(project_root, "results", f"attempt_{timestamp}")
+    icm_root = os.path.join(attempt_root, "icm")
+    os.makedirs(icm_root, exist_ok=True)
+
+    print(
+        "Running ICM demo on TruthfulQA-like data... / 在 TruthfulQA 数据上运行 ICM Demo..."
+    )
+    print(f"[ICM-DEMO] Attempt folder: {attempt_root}")
+
     result_subset = icm_main(
         data=sample_data,
         model=model,
@@ -1231,7 +1290,8 @@ def run_icm_demo():
         seed=42,
         debug=False,
         consistency_mode="at_most_one_true",
-        enforce_unique_cid=False,  # demo: paper-style (no uniqueness constraint) / Demo：更贴近论文的无唯一性约束设置
+        enforce_unique_cid=False,   # demo: paper-style (no uniqueness constraint) / Demo：更贴近论文的无唯一性约束设置
+        result_root=icm_root,
     )
 
     print("\nFinal labeled subset / 最终带标签子集：")
