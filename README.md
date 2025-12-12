@@ -1,6 +1,7 @@
 # ICM-tools: Unsupervised Elicitation Replication (Phase 1 Project)
 
 [Link to **Colab**](https://colab.research.google.com/drive/155_JUHspvvQEENT6vrU4jsy2EFrfbF2d?usp=sharing)
+(Note: It's a different execution on Colab and the result is a little bit different. But the basic trend remains the same.)
 
 This repository implements **Internal Coherence Maximization (ICM)** from  
 *Unsupervised Elicitation of Language Models* (Wen et al., 2025), and reproduces the TruthfulQA results required for Praxis Sprint UE1.
