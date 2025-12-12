@@ -218,19 +218,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--icm-initial-t",
         type=float,
-        default=5.0,
+        default=10,
         help="Initial temperature for ICM. / ICM 初始温度。",
     )
     parser.add_argument(
         "--icm-final-t",
         type=float,
-        default=0.1,
+        default=0.01,
         help="Final temperature lower bound for ICM. / ICM 最终温度下限。",
     )
     parser.add_argument(
         "--icm-decay",
         type=float,
-        default=0.98,
+        default=0.99,
         help="Decay rate for exponential schedule or factor in log schedule. / 指数或对数温度调度的衰减参数。",
     )
     parser.add_argument(
@@ -481,6 +481,46 @@ def main():
                 )
             else:
                 print("[MAIN] Standalone ICM disabled (--do-icm not set). / 未启用独立 ICM (--do-icm 未设置)。")
+
+            # --------------------- Auto-generate plots ---------------------
+            # --------------------- 自动生成 TruthfulQA 图表 ----------------
+            try:
+                # 延迟导入，避免在不需要画图时增加启动开销
+                from eval.plot_truthfulqa_eval import (
+                    plot_truthfulqa_main_settings_bar,
+                    plot_truthfulqa_unsup_variants,
+                    plot_truthfulqa_three_u_curves,  # 三个 U(D) 轨迹图
+                )
+
+                print("\n[MAIN] Generating TruthfulQA figures...")
+                print(f"[MAIN] Plot attempt root: {attempt_root}")
+
+                # 1) 主四条曲线 / main settings bar (zero-shot, chat, supervised, unsupervised)
+                plot_truthfulqa_main_settings_bar(
+                    attempt_root,
+                    show=False,
+                )
+                print("[MAIN]  - main_settings_bar generated.")
+
+                # 2) unsupervised 三种 MP method 对比
+                plot_truthfulqa_unsup_variants(
+                    attempt_root,
+                    show=False,
+                )
+                print("[MAIN]  - unsup_variants generated.")
+
+                # 3) 三条 U(D) 轨迹图（original + 两个新增图表中与 U(D) 相关的那个）
+                plot_truthfulqa_three_u_curves(
+                    attempt_root,
+                    show=False,
+                )
+                print("[MAIN]  - three U(D) curves generated.")
+
+                print("[MAIN] All TruthfulQA figures generated successfully.")
+            except ImportError as e:
+                print(f"[MAIN] Plot modules not available, skip plotting. / 未找到绘图模块，跳过画图。 Detail: {e}")
+            except Exception as e:
+                print(f"[MAIN] Plotting failed, but main run succeeded. / 画图失败，但主流程已完成。Detail: {e}")
 
             print("\n[MAIN] All requested work finished. / 所有请求的任务已完成。")
 
