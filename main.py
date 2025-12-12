@@ -188,7 +188,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--icm-alpha",
         type=float,
-        default=1.0,  # Changed default back to 1.0 as per paper recommendation, user can override.
+        default=30.0,  # Changed default back to 1.0 as per paper recommendation, user can override.
         help="Alpha in U(D) = alpha * P(D) - I(D). / U(D) 中的 alpha 系数。",
     )
     parser.add_argument(
