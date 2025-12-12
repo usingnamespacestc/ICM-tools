@@ -8,12 +8,15 @@ Hyperbolic API helper (async).
 - 使用同一个函数自动区分 Base 与 Instruct 模型：
   * Base -> /v1/completions（支持 logprobs）
   * Instruct/Chat -> /v1/chat/completions（尝试开启 logprobs + top_logprobs）
+- [New] Added exponential backoff retry for 429 (Rate Limit) errors.
+- [新增] 增加了针对 429 (限流) 错误的指数退避重试机制。
 """
 
 import json
 import asyncio
 import os
 import httpx
+import random  # Added for retry jitter / 用于重试抖动
 
 from utils.database import (
     init_db,
@@ -36,18 +39,18 @@ def _is_chat_model(model_name: str) -> bool:
 
 
 async def hyperbolic_completion_with_logprobs_async(
-    model: str,
-    prompt: str,
-    api_key: str = None,
-    timeout: float = 60.0,
-    top_logprobs: int = 5,
-    max_tokens: int = 512,
-    echo: bool = False,
-    temperature: float | None = None,  # Sampling temperature / 采样温度
-    top_p: float | None = None,        # Nucleus sampling top_p / 核采样 top_p
-    stop: list[str] | None = None,     # Optional stop tokens / 可选的停止 token 列表
-    debug: bool = False,
-    database: bool = True,
+        model: str,
+        prompt: str,
+        api_key: str = None,
+        timeout: float = 60.0,
+        top_logprobs: int = 5,
+        max_tokens: int = 512,
+        echo: bool = False,
+        temperature: float | None = None,  # Sampling temperature / 采样温度
+        top_p: float | None = None,  # Nucleus sampling top_p / 核采样 top_p
+        stop: list[str] | None = None,  # Optional stop tokens / 可选的停止 token 列表
+        debug: bool = False,
+        database: bool = True,
 ) -> dict | None:
     """
     Call Hyperbolic with logprobs support (async).
@@ -237,38 +240,95 @@ async def hyperbolic_completion_with_logprobs_async(
         print(">>> Sending request to Hyperbolic API...")
         print(f"URL: {url}")
         print(f"Model: {model}")
-        print(f"Payload: {json.dumps(payload, ensure_ascii=False)}")
+        # Truncate prompt in logs if too long / 如果 prompt 太长则截断打印
+        log_payload = dict(payload)
+        if is_chat:
+            if len(log_payload['messages'][0]['content']) > 500:
+                log_payload['messages'][0]['content'] = log_payload['messages'][0]['content'][:500] + "...(truncated)"
+        else:
+            if len(log_payload['prompt']) > 500:
+                log_payload['prompt'] = log_payload['prompt'][:500] + "...(truncated)"
+        print(f"Payload (truncated): {json.dumps(log_payload, ensure_ascii=False)}")
         print("--------------------------------------------------")
 
     # ------------------------------------------------------------
-    # HTTP request
-    # 发送 HTTP 请求
+    # HTTP request with Retry Logic (Exponential Backoff)
+    # 发送 HTTP 请求 (带指数退避重试逻辑)
     # ------------------------------------------------------------
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        try:
-            response = await client.post(
-                url,
-                headers=headers,
-                json=payload,
-            )
-            response.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            print(f">>> HTTP status error / HTTP 状态错误: {exc}")
-            if exc.response is not None:
-                print("Status code / 状态码:", exc.response.status_code)
-                print("Response text / 响应文本:", exc.response.text)
-            raise
-        except httpx.HTTPError as exc:
-            print(f">>> HTTP error / HTTP 错误: {exc}")
-            raise
 
-    data = response.json()
+    # Retry configuration / 重试配置
+    max_retries = 10
+    base_delay = 2.0  # seconds / 秒
+    backoff_factor = 1.5
+
+    data = None
+
+    for attempt in range(max_retries + 1):
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.post(
+                    url,
+                    headers=headers,
+                    json=payload,
+                )
+                response.raise_for_status()
+
+                # If successful, get json and break the loop
+                # 若成功则获取 JSON 并跳出循环
+                data = response.json()
+                break
+
+        except httpx.HTTPStatusError as exc:
+            status_code = exc.response.status_code
+
+            # 429: Too Many Requests (Rate Limit)
+            # 5xx: Server Errors (Temporary issues)
+            # 429: 请求过多 (限流)
+            # 5xx: 服务器错误 (临时故障)
+            if status_code == 429 or 500 <= status_code < 600:
+                if attempt == max_retries:
+                    print(f">>> [Hyperbolic] Max retries reached. Last status: {status_code} / 达到最大重试次数。")
+                    print(">>> Response text:", exc.response.text)
+                    raise
+
+                # Calculate sleep time: base * factor^attempt + jitter
+                # 计算等待时间：基础时间 * 系数^次数 + 随机抖动
+                sleep_time = base_delay * (backoff_factor ** attempt) + random.uniform(0, 1.0)
+
+                # Always print warning for 429 even if not debug / 即使非 debug 模式遇到 429 也打印警告
+                if debug or status_code == 429:
+                    err_type = "Rate limit" if status_code == 429 else "Server error"
+                    print(
+                        f">>> [Hyperbolic] {err_type} ({status_code}). Retrying in {sleep_time:.2f}s... (Attempt {attempt + 1}/{max_retries})")
+
+                await asyncio.sleep(sleep_time)
+                continue
+
+            else:
+                # 400, 401, 403 etc. are likely fatal client errors
+                # 400, 401, 403 等通常是致命的客户端错误，不重试
+                print(f">>> [Hyperbolic] Fatal HTTP error / 致命 HTTP 错误: {exc}")
+                print(">>> Response text:", exc.response.text)
+                raise
+
+        except httpx.RequestError as exc:
+            # Connection errors (DNS, timeout, etc.)
+            # 连接错误 (DNS, 超时等)
+            if attempt == max_retries:
+                print(f">>> [Hyperbolic] Connection failed after {max_retries} retries / 重试后连接失败: {exc}")
+                raise
+
+            sleep_time = base_delay * (backoff_factor ** attempt)
+            if debug:
+                print(f">>> [Hyperbolic] Connection error: {exc}. Retrying in {sleep_time:.2f}s...")
+            await asyncio.sleep(sleep_time)
+            continue
 
     # ------------------------------------------------------------
     # Save to database
     # 将结果写入数据库
     # ------------------------------------------------------------
-    if database:
+    if database and data:
         try:
             save_result_to_db(
                 model=model,
@@ -363,9 +423,9 @@ async def _demo_chat() -> None:
             model="meta-llama/Meta-Llama-3.1-405B-Instruct",
             prompt=prompt,
             timeout=120.0,
-            top_logprobs=5,   # Hyperbolic 目前 chat 端可能不返回 logprobs
+            top_logprobs=5,  # Hyperbolic 目前 chat 端可能不返回 logprobs
             max_tokens=1,
-            echo=True,        # ignored for chat
+            echo=True,  # ignored for chat
             temperature=0.0,
             top_p=1.0,
             stop=["\n"],

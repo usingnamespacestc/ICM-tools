@@ -11,9 +11,9 @@ This script allows you to:
         evaluation/
             ... per-setting JSON + *_arguments.json
         icm/
-            target_subset.json
-            ud.json
-            icm_arguments.json
+            official/
+            ll_stub/
+            utfs/
         output.txt   (captured console output)
 
 该脚本允许你：
@@ -24,9 +24,9 @@ This script allows you to:
         evaluation/
             ... 各 setting 的 JSON + *_arguments.json
         icm/
-            target_subset.json
-            ud.json
-            icm_arguments.json
+            official/
+            ll_stub/
+            utfs/
         output.txt   （整体输出日志）
 """
 
@@ -46,12 +46,16 @@ class Tee(io.TextIOBase):
     Simple tee to write to multiple streams (file + original stdout/stderr).
     将输出同时写入多个流（文件 + 原始 stdout/stderr）的简单 Tee。
     """
+
     def __init__(self, *streams):
         self.streams = streams
 
     def write(self, data):
         for s in self.streams:
             s.write(data)
+            # Force flush immediately to capture logs even if crash happens
+            # 立即强制刷新，确保即使发生崩溃也能捕获日志
+            s.flush()
         return len(data)
 
     def flush(self):
@@ -178,13 +182,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--icm-mp-method",
         type=str,
         default="official",
-        choices=["official", "ll_stub"],
-        help="Mutual Predictability method for ICM. / ICM 中使用的 MP 方法。",
+        choices=["official", "ll_stub", "utfs"],
+        help="Mutual Predictability method for ICM (used for standalone run or single run). / ICM 中使用的 MP 方法（用于独立运行或单次运行）。",
     )
     parser.add_argument(
         "--icm-alpha",
         type=float,
-        default=1.0,
+        default=1.0,  # Changed default back to 1.0 as per paper recommendation, user can override.
         help="Alpha in U(D) = alpha * P(D) - I(D). / U(D) 中的 alpha 系数。",
     )
     parser.add_argument(
@@ -196,7 +200,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--icm-max-iter",
         type=int,
-        default=256 * 25,
+        default=256*4,
         help="Max iterations for ICM simulated annealing. / ICM 模拟退火的最大迭代次数。",
     )
     parser.add_argument(
@@ -237,6 +241,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Temperature schedule for ICM (log or exp). / ICM 温度调度模式（log 或 exp）。",
     )
 
+    # [NEW] Concurrency Control
+    parser.add_argument(
+        "--icm-max-concurrent",
+        type=int,
+        default=4,
+        help="Max concurrent API calls for ICM (default 1 to avoid 429). / ICM 最大并发 API 调用数（默认 1 以避免 429）。",
+    )
+
     return parser
 
 
@@ -273,6 +285,7 @@ def main():
     original_stderr = sys.stderr
 
     with open(output_path, "w", encoding="utf-8") as output_file:
+        # Use simple unbuffered Tee
         tee = Tee(original_stdout, output_file)
         sys.stdout = tee
         sys.stderr = tee
@@ -284,6 +297,7 @@ def main():
             print(f"[MAIN] Evaluation dir: {eval_root}")
             print(f"[MAIN] ICM dir       : {icm_root}")
             print(f"[MAIN] Output log    : {output_path}")
+            print(f"[MAIN] Concurrency   : {args.icm_max_concurrent}")
             print("====================================\n")
 
             api_key = get_env_api_key()
@@ -365,28 +379,41 @@ def main():
                         )
 
                     elif setting == "unsupervised":
-                        print("\n[MAIN] Running unsupervised (ICM few-shot)...")
-                        evaluate(
-                            data=args.test_path,
-                            setting="unsupervised",
-                            model=args.base_model,
-                            api_key=api_key,
-                            train_data_for_icm=args.train_path,
-                            icm_mp_method=args.icm_mp_method,
-                            icm_alpha=args.icm_alpha,
-                            icm_target_subset_size=args.icm_target_subset_size,
-                            icm_max_iter=args.icm_max_iter,
-                            icm_consistency_mode=args.icm_consistency_mode,
-                            icm_enforce_unique_cid=args.icm_enforce_unique_cid,
-                            timeout=args.timeout,
-                            max_tokens=args.max_tokens,
-                            debug=args.debug,
-                            save_result=True,
-                            result_root=eval_root,
-                            icm_result_root=icm_root,
-                            dataset_name=args.dataset_name,
-                            random_fewshot_k=args.random_fewshot_k,
+                        # UPDATED LOGIC: Run loop through all methods by default
+                        # 更新逻辑：默认循环运行所有方法 (official, ll_stub, utfs)
+                        mp_methods = ["official", "ll_stub", "utfs"]
+                        print(
+                            f"\n[MAIN] Running unsupervised (ICM few-shot) for mp_methods={mp_methods}..."
                         )
+                        for mp_method in mp_methods:
+                            print(
+                                f"\n[MAIN] Running unsupervised (ICM few-shot) with icm_mp_method='{mp_method}'..."
+                            )
+                            # Create sub-directory logic handled inside evaluate via icm_result_root + mp_method
+                            # 子目录逻辑在 evaluate 内部通过 icm_result_root + mp_method 处理
+
+                            evaluate(
+                                data=args.test_path,
+                                setting=f"unsupervised_{mp_method}",  # Tag setting name
+                                model=args.base_model,
+                                api_key=api_key,
+                                train_data_for_icm=args.train_path,
+                                icm_mp_method=mp_method,  # Force current method in loop
+                                icm_alpha=args.icm_alpha,
+                                icm_target_subset_size=args.icm_target_subset_size,
+                                icm_max_iter=args.icm_max_iter,
+                                icm_consistency_mode=args.icm_consistency_mode,
+                                icm_enforce_unique_cid=args.icm_enforce_unique_cid,
+                                icm_max_concurrent=args.icm_max_concurrent,  # Pass concurrency
+                                timeout=args.timeout,
+                                max_tokens=args.max_tokens,
+                                debug=args.debug,
+                                save_result=True,
+                                result_root=eval_root,
+                                icm_result_root=icm_root,
+                                dataset_name=args.dataset_name,
+                                random_fewshot_k=args.random_fewshot_k,
+                            )
 
                     elif setting == "random_few_shot":
                         print("\n[MAIN] Running random_few_shot (fixed-K gold few-shot)...")
@@ -424,6 +451,10 @@ def main():
             # --------------------- 运行独立 ICM ---------------------------
             if args.do_icm:
                 print("\n[MAIN] Running standalone ICM on training data...")
+                # Also use specific MP method subfolder for standalone run
+                standalone_icm_root = os.path.join(icm_root, args.icm_mp_method)
+                os.makedirs(standalone_icm_root, exist_ok=True)
+
                 icm_main(
                     data=args.train_path,
                     model=args.base_model,
@@ -439,14 +470,14 @@ def main():
                     use_consistency_term=True,
                     timeout=args.timeout,
                     top_logprobs=20,
-                    max_concurrent=4,
+                    max_concurrent=args.icm_max_concurrent,  # [Fix] Use CLI arg, not hardcoded 4 / 使用 CLI 参数
                     save_result=True,
                     result_prefix=f"icm_cli_{args.dataset_name}",
                     seed=42,
                     debug=args.debug,
                     consistency_mode=args.icm_consistency_mode,
                     enforce_unique_cid=args.icm_enforce_unique_cid,
-                    result_root=icm_root,
+                    result_root=standalone_icm_root,
                 )
             else:
                 print("[MAIN] Standalone ICM disabled (--do-icm not set). / 未启用独立 ICM (--do-icm 未设置)。")
